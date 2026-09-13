@@ -1,7 +1,7 @@
 """Utilities for GRPO training."""
 
 import torch
-from transformers import PreTrainedTokenizerBase
+from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 
 def tokenize_prompt_and_output(
@@ -57,3 +57,28 @@ def tokenize_prompt_and_output(
         "labels": padded_token_ids[:, 1:],
         "response_mask": token_is_response[:, 1:],
     }
+
+
+def get_response_log_probs(
+    model: PreTrainedModel,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    return_token_entropy: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Score each label token under the model's next-token distribution."""
+    if input_ids.shape != labels.shape:
+        raise ValueError("input_ids and labels must have the same shape.")
+
+    logits = model(input_ids=input_ids).logits
+    all_log_probs = torch.log_softmax(logits, dim=-1, dtype=torch.float32)
+    label_log_probs = torch.gather(
+        all_log_probs,
+        dim=-1,
+        index=labels.unsqueeze(-1),
+    ).squeeze(-1)
+
+    result = {"log_probs": label_log_probs}
+    if return_token_entropy:
+        probabilities = all_log_probs.exp()
+        result["token_entropy"] = -(probabilities * all_log_probs).sum(dim=-1)
+    return result
