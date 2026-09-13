@@ -1,5 +1,8 @@
 """Utilities for GRPO training."""
 
+from collections.abc import Callable
+from typing import Literal
+
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
@@ -82,3 +85,84 @@ def get_response_log_probs(
         probabilities = all_log_probs.exp()
         result["token_entropy"] = -(probabilities * all_log_probs).sum(dim=-1)
     return result
+
+
+def compute_rollout_rewards(
+    reward_fn: Callable[[str, str], dict[str, float]],
+    rollout_responses: list[str],
+    repeated_ground_truths: list[str],
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Score rollout responses and summarize their reward components."""
+    if len(rollout_responses) != len(repeated_ground_truths):
+        raise ValueError(
+            "rollout_responses and repeated_ground_truths must have the same length."
+        )
+    if not rollout_responses:
+        raise ValueError("rollout_responses must not be empty.")
+
+    reward_results = [
+        reward_fn(response, ground_truth)
+        for response, ground_truth in zip(
+            rollout_responses,
+            repeated_ground_truths,
+            strict=True,
+        )
+    ]
+
+    raw_rewards = torch.tensor(
+        [result["reward"] for result in reward_results],
+        dtype=torch.float32,
+    )
+    metadata = {
+        "reward_mean": raw_rewards.mean().item(),
+        "format_reward_mean": sum(
+            result["format_reward"] for result in reward_results
+        )
+        / len(reward_results),
+        "answer_reward_mean": sum(
+            result["answer_reward"] for result in reward_results
+        )
+        / len(reward_results),
+    }
+    return raw_rewards, metadata
+
+
+def compute_group_normalized_rewards(
+    raw_rewards: torch.Tensor,
+    group_size: int,
+    baseline: Literal["mean", "none"] = "mean",
+    advantage_eps: float = 1e-6,
+    advantage_normalizer: Literal["std", "mean", "none"] = "std",
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Convert each group's raw rewards into normalized advantages."""
+    if baseline != "mean":
+        raise NotImplementedError(f"Unsupported baseline: {baseline}")
+    if advantage_normalizer != "std":
+        raise NotImplementedError(
+            f"Unsupported advantage normalizer: {advantage_normalizer}"
+        )
+    if raw_rewards.ndim != 1:
+        raise ValueError("raw_rewards must be a one-dimensional tensor.")
+    if group_size <= 0:
+        raise ValueError("group_size must be positive.")
+    if raw_rewards.numel() == 0:
+        raise ValueError("raw_rewards must not be empty.")
+    if raw_rewards.numel() % group_size != 0:
+        raise ValueError("The number of rewards must be divisible by group_size.")
+
+    grouped_rewards = raw_rewards.reshape(-1, group_size)
+    group_means = grouped_rewards.mean(dim=1, keepdim=True)
+    if group_size == 1:
+        group_stds = torch.zeros_like(group_means)
+    else:
+        group_stds = grouped_rewards.std(dim=1, keepdim=True, correction=1)
+
+    grouped_advantages = (grouped_rewards - group_means) / (
+        group_stds + advantage_eps
+    )
+    advantages = grouped_advantages.flatten()
+    metadata = {
+        "advantage_mean": advantages.mean().item(),
+        "advantage_std": advantages.std(correction=0).item(),
+    }
+    return advantages, metadata
