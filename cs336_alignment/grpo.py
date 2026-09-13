@@ -166,3 +166,41 @@ def compute_group_normalized_rewards(
         "advantage_std": advantages.std(correction=0).item(),
     }
     return advantages, metadata
+
+
+def compute_policy_gradient_loss(
+    raw_rewards_or_advantages: torch.Tensor,
+    policy_log_probs: torch.Tensor,
+    importance_reweighting_method: Literal[
+        "none", "noclip", "grpo", "gspo"
+    ] = "none",
+    old_log_probs: torch.Tensor | None = None,
+    cliprange: float | None = None,
+    response_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute the on-policy policy-gradient loss at each token."""
+    del old_log_probs, cliprange, response_mask
+
+    if importance_reweighting_method != "none":
+        raise NotImplementedError(
+            "Importance reweighting is not implemented yet."
+        )
+    if policy_log_probs.ndim != 2:
+        raise ValueError("policy_log_probs must have shape (batch_size, sequence_length).")
+    if raw_rewards_or_advantages.ndim == 1:
+        advantages = raw_rewards_or_advantages.unsqueeze(1)
+    elif (
+        raw_rewards_or_advantages.ndim == 2
+        and raw_rewards_or_advantages.shape[1] == 1
+    ):
+        advantages = raw_rewards_or_advantages
+    else:
+        raise ValueError(
+            "raw_rewards_or_advantages must have shape (batch_size,) "
+            "or (batch_size, 1)."
+        )
+    if advantages.shape[0] != policy_log_probs.shape[0]:
+        raise ValueError("Advantages and policy_log_probs must have the same batch size.")
+
+    per_token_loss = -advantages * policy_log_probs
+    return per_token_loss, {}
