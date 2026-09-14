@@ -8,13 +8,18 @@ import logging
 import random
 import signal
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
 
 from cs336_alignment.checkpoint import get_model_and_tokenizer
-from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+from cs336_alignment.drgrpo_grader import (
+    question_only_reward_fn,
+    r1_zero_reward_fn,
+)
 from cs336_alignment.grpo import grpo_train_step
 from cs336_alignment.vllm_utils import VLLMCompletion, VLLMServer
 
@@ -23,10 +28,38 @@ LOGGER = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 DEFAULT_MODEL_ID = "allenai/OLMo-2-0425-1B"
-DEFAULT_PROMPT_PATH = REPO_ROOT / "cs336_alignment" / "prompts" / "r1_zero.prompt"
 DEFAULT_TRAIN_PATH = REPO_ROOT / "data" / "gsm8k" / "train.jsonl"
 DEFAULT_VALIDATION_PATH = REPO_ROOT / "data" / "gsm8k" / "test.jsonl"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "outputs" / "grpo"
+PROMPT_DIR = REPO_ROOT / "cs336_alignment" / "prompts"
+
+RewardFunction = Callable[[str, str], dict[str, float]]
+
+
+@dataclass(frozen=True)
+class PromptConfig:
+    template_path: Path
+    reward_function: RewardFunction
+    stop: list[str] | None
+
+
+PROMPT_CONFIGS = {
+    "question_only": PromptConfig(
+        template_path=PROMPT_DIR / "question_only.prompt",
+        reward_function=question_only_reward_fn,
+        stop=None,
+    ),
+    "r1_zero": PromptConfig(
+        template_path=PROMPT_DIR / "r1_zero.prompt",
+        reward_function=r1_zero_reward_fn,
+        stop=["</answer>"],
+    ),
+    "r1_zero_three_shot": PromptConfig(
+        template_path=PROMPT_DIR / "r1_zero_three_shot_gsm8k.prompt",
+        reward_function=r1_zero_reward_fn,
+        stop=["</answer>"],
+    ),
+}
 
 
 class GracefulShutdown(Exception):
@@ -81,6 +114,7 @@ def generate_rollout_batch(
     max_tokens: int,
     seed: int,
     request_batch_size: int,
+    stop: list[str] | None,
 ) -> tuple[list[str], list[str], list[str], list[VLLMCompletion]]:
     """Generate ``group_size`` responses for every training prompt."""
     prompts = [
@@ -95,7 +129,7 @@ def generate_rollout_batch(
             "max_tokens": max_tokens,
             "n": group_size,
             "seed": seed,
-            "stop": ["</answer>"],
+            "stop": stop,
             "include_stop_str_in_output": True,
         },
         batch_size=request_batch_size,
@@ -128,6 +162,8 @@ def evaluate(
     max_tokens: int,
     seed: int,
     request_batch_size: int,
+    reward_fn: RewardFunction,
+    stop: list[str] | None,
 ) -> tuple[dict[str, float], list[dict[str, Any]]]:
     """Evaluate one sampled response for every validation example."""
     prompts = [
@@ -142,7 +178,7 @@ def evaluate(
             "max_tokens": max_tokens,
             "n": 1,
             "seed": seed,
-            "stop": ["</answer>"],
+            "stop": stop,
             "include_stop_str_in_output": True,
         },
         batch_size=request_batch_size,
@@ -164,7 +200,7 @@ def evaluate(
         strict=True,
     ):
         ground_truth = parse_ground_truth(example["answer"])
-        rewards = r1_zero_reward_fn(completion.text, ground_truth)
+        rewards = reward_fn(completion.text, ground_truth)
         token_count = len(completion.token_ids)
         if token_count == 0:
             token_count = len(
@@ -203,13 +239,14 @@ def make_training_rollout_records(
     ground_truths: list[str],
     completions: list[VLLMCompletion],
     group_size: int,
+    reward_fn: RewardFunction,
 ) -> list[dict[str, Any]]:
     """Build inspectable records for periodically logged training rollouts."""
     records = []
     for index, (prompt, response, ground_truth, completion) in enumerate(
         zip(prompts, responses, ground_truths, completions, strict=True)
     ):
-        rewards = r1_zero_reward_fn(response, ground_truth)
+        rewards = reward_fn(response, ground_truth)
         example = examples[index // group_size]
         records.append(
             {
@@ -317,7 +354,16 @@ def parse_args() -> argparse.Namespace:
         description="Train OLMo-2-0425-1B on GSM8K with on-policy GRPO."
     )
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
-    parser.add_argument("--prompt-path", type=Path, default=DEFAULT_PROMPT_PATH)
+    parser.add_argument(
+        "--prompt-style",
+        choices=tuple(PROMPT_CONFIGS),
+        default="r1_zero",
+    )
+    parser.add_argument(
+        "--prompt-path",
+        type=Path,
+        help="Override the template associated with --prompt-style.",
+    )
     parser.add_argument("--train-data-path", type=Path, default=DEFAULT_TRAIN_PATH)
     parser.add_argument(
         "--validation-data-path",
@@ -402,6 +448,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    prompt_config = PROMPT_CONFIGS[args.prompt_style]
+    prompt_path = args.prompt_path or prompt_config.template_path
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
@@ -444,9 +492,10 @@ def main() -> None:
         key: str(value) if isinstance(value, Path) else value
         for key, value in vars(args).items()
     }
+    config["resolved_prompt_path"] = str(prompt_path)
     (run_dir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
 
-    prompt_template = args.prompt_path.read_text()
+    prompt_template = prompt_path.read_text()
     policy_device = f"cuda:{args.policy_gpu}"
     server = VLLMServer(
         model_id=args.model_id,
@@ -486,6 +535,8 @@ def main() -> None:
             max_tokens=args.sampling_max_tokens,
             seed=args.seed,
             request_batch_size=args.vllm_request_batch_size,
+            reward_fn=prompt_config.reward_function,
+            stop=prompt_config.stop,
         )
         log_metrics(metrics_path, wandb_run, step=0, metrics=validation_metrics)
         write_jsonl(run_dir / "validation_rollouts_step_0000.jsonl", validation_records)
@@ -513,6 +564,7 @@ def main() -> None:
                     max_tokens=args.sampling_max_tokens,
                     seed=args.seed + step,
                     request_batch_size=args.vllm_request_batch_size,
+                    stop=prompt_config.stop,
                 )
             )
 
@@ -522,7 +574,7 @@ def main() -> None:
                 optimizer=optimizer,
                 gradient_accumulation_steps=args.gradient_accumulation_steps,
                 max_grad_norm=args.max_grad_norm,
-                reward_fn=r1_zero_reward_fn,
+                reward_fn=prompt_config.reward_function,
                 repeated_prompts=repeated_prompts,
                 rollout_responses=responses,
                 repeated_ground_truths=repeated_ground_truths,
@@ -557,6 +609,7 @@ def main() -> None:
                     ground_truths=repeated_ground_truths,
                     completions=completions,
                     group_size=args.group_size,
+                    reward_fn=prompt_config.reward_function,
                 )
                 write_jsonl(
                     run_dir / f"train_rollouts_step_{step:04d}.jsonl",
@@ -585,6 +638,8 @@ def main() -> None:
                     max_tokens=args.sampling_max_tokens,
                     seed=args.seed,
                     request_batch_size=args.vllm_request_batch_size,
+                    reward_fn=prompt_config.reward_function,
+                    stop=prompt_config.stop,
                 )
                 log_metrics(
                     metrics_path,
