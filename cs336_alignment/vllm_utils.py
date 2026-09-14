@@ -222,11 +222,13 @@ def generate_completions(
 
 def init_weight_sync(vllm_base_url: str, policy_device: str):
     from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
-    from vllm.utils.network_utils import get_ip, get_open_port
+    from vllm.utils.network_utils import get_open_port
 
     inference_world_size = _http_json("GET", f"{vllm_base_url}/get_world_size", timeout=10)["world_size"]
     world_size = inference_world_size + 1
-    master_address = get_ip()
+    # The trainer and vLLM server are local processes. Using loopback avoids
+    # selecting an IPv6 address for vLLM's IPv4-only stateless process group.
+    master_address = "127.0.0.1"
     master_port = get_open_port()
     init_info = {
         "master_address": master_address,

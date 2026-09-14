@@ -245,6 +245,37 @@ def test_grpo_train_step_standard_on_policy(numpy_snapshot, tiny_train_model, to
     assert all(param.grad is None for param in tiny_train_model.parameters())
 
 
+def test_grpo_train_step_scores_immediate_eos(tiny_train_model, tokenizer):
+    prompts = ["Hello", "Hello"]
+    responses = ["", "world"]
+
+    def reward_fn(response: str, ground_truth: str) -> dict[str, float]:
+        del ground_truth
+        reward = float(response == "world")
+        return {
+            "reward": reward,
+            "format_reward": reward,
+            "answer_reward": reward,
+        }
+
+    loss, metadata = grpo_train_step(
+        model=tiny_train_model,
+        tokenizer=tokenizer,
+        optimizer=_train_step_optimizer(tiny_train_model),
+        gradient_accumulation_steps=1,
+        max_grad_norm=1.0,
+        reward_fn=reward_fn,
+        repeated_prompts=prompts,
+        rollout_responses=responses,
+        repeated_ground_truths=["42", "42"],
+        group_size=2,
+    )
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(metadata["gradient_norm"])
+    assert all(param.grad is None for param in tiny_train_model.parameters())
+
+
 @pytest.mark.parametrize(
     "variant_kwargs",
     [

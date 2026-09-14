@@ -536,6 +536,10 @@ def main() -> None:
                 "train/format_reward": float(
                     train_metadata["format_reward_mean"]
                 ),
+                "train/empty_response_fraction": sum(
+                    response == "" for response in responses
+                )
+                / len(responses),
             }
             log_metrics(metrics_path, wandb_run, step=step, metrics=train_metrics)
             last_completed_step = step

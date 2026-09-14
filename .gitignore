@@ -169,3 +169,4 @@ cython_debug/
 
 # Generated evaluation results
 /outputs/
+/wandb/

@@ -305,9 +305,23 @@ def grpo_train_step(
         advantage_eps=advantage_eps,
         advantage_normalizer=advantage_normalizer,
     )
+
+    # vLLM returns an empty string when the first sampled token is EOS. Score
+    # that EOS action explicitly so every rollout contributes a valid response
+    # token to sequence-normalized training.
+    if any(response == "" for response in rollout_responses):
+        if tokenizer.eos_token is None:
+            raise ValueError("tokenizer must define an EOS token for empty rollouts.")
+        responses_for_scoring = [
+            tokenizer.eos_token if response == "" else response
+            for response in rollout_responses
+        ]
+    else:
+        responses_for_scoring = rollout_responses
+
     tokenized = tokenize_prompt_and_output(
         prompt_strs=repeated_prompts,
-        output_strs=rollout_responses,
+        output_strs=responses_for_scoring,
         tokenizer=tokenizer,
     )
 
