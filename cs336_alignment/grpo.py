@@ -204,3 +204,35 @@ def compute_policy_gradient_loss(
 
     per_token_loss = -advantages * policy_log_probs
     return per_token_loss, {}
+
+
+def aggregate_loss_across_microbatch(
+    per_token_policy_gradient_loss: torch.Tensor,
+    mask: torch.Tensor,
+    loss_normalization: Literal["sequence", "constant"] = "sequence",
+    normalization_constant: int | None = None,
+) -> torch.Tensor:
+    """Average response-token losses within sequences and across the batch."""
+    del normalization_constant
+
+    if loss_normalization != "sequence":
+        raise NotImplementedError(
+            f"Unsupported loss normalization: {loss_normalization}"
+        )
+    if per_token_policy_gradient_loss.ndim != 2:
+        raise ValueError(
+            "per_token_policy_gradient_loss must have shape "
+            "(batch_size, sequence_length)."
+        )
+    if mask.shape != per_token_policy_gradient_loss.shape:
+        raise ValueError(
+            "mask and per_token_policy_gradient_loss must have the same shape."
+        )
+
+    response_token_counts = mask.sum(dim=1)
+    if torch.any(response_token_counts == 0):
+        raise ValueError("Every sequence must contain at least one response token.")
+
+    masked_loss = per_token_policy_gradient_loss * mask
+    loss_per_sequence = masked_loss.sum(dim=1) / response_token_counts
+    return loss_per_sequence.mean()
