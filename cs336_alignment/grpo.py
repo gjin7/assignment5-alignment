@@ -236,3 +236,144 @@ def aggregate_loss_across_microbatch(
     masked_loss = per_token_policy_gradient_loss * mask
     loss_per_sequence = masked_loss.sum(dim=1) / response_token_counts
     return loss_per_sequence.mean()
+
+
+def grpo_train_step(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    optimizer: torch.optim.Optimizer,
+    gradient_accumulation_steps: int,
+    max_grad_norm: float | None,
+    reward_fn: Callable[[str, str], dict[str, float]],
+    repeated_prompts: list[str],
+    rollout_responses: list[str],
+    repeated_ground_truths: list[str],
+    group_size: int,
+    baseline: Literal["mean", "none"] = "mean",
+    advantage_eps: float = 1e-6,
+    advantage_normalizer: Literal["std", "none", "mean"] = "std",
+    importance_reweighting_method: Literal[
+        "none", "noclip", "grpo", "gspo"
+    ] = "none",
+    old_log_probs: torch.Tensor | None = None,
+    cliprange: float | None = None,
+    loss_normalization: Literal["sequence", "constant"] = "sequence",
+    normalization_constant: int | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
+    """Run one standard on-policy GRPO update over a rollout batch."""
+    if baseline != "mean":
+        raise NotImplementedError(f"Unsupported baseline: {baseline}")
+    if advantage_normalizer != "std":
+        raise NotImplementedError(
+            f"Unsupported advantage normalizer: {advantage_normalizer}"
+        )
+    if importance_reweighting_method != "none":
+        raise NotImplementedError(
+            "Importance reweighting is not implemented yet."
+        )
+    if loss_normalization != "sequence":
+        raise NotImplementedError(
+            f"Unsupported loss normalization: {loss_normalization}"
+        )
+
+    batch_size = len(rollout_responses)
+    if len(repeated_prompts) != batch_size:
+        raise ValueError("repeated_prompts and rollout_responses must have the same length.")
+    if len(repeated_ground_truths) != batch_size:
+        raise ValueError(
+            "repeated_ground_truths and rollout_responses must have the same length."
+        )
+    if gradient_accumulation_steps <= 0:
+        raise ValueError("gradient_accumulation_steps must be positive.")
+    if batch_size % gradient_accumulation_steps != 0:
+        raise ValueError(
+            "The rollout batch size must be divisible by "
+            "gradient_accumulation_steps."
+        )
+
+    # Group normalization needs every response for a prompt, so calculate all
+    # advantages before splitting the rollout batch into microbatches.
+    raw_rewards, reward_metadata = compute_rollout_rewards(
+        reward_fn=reward_fn,
+        rollout_responses=rollout_responses,
+        repeated_ground_truths=repeated_ground_truths,
+    )
+    advantages, advantage_metadata = compute_group_normalized_rewards(
+        raw_rewards=raw_rewards,
+        group_size=group_size,
+        baseline=baseline,
+        advantage_eps=advantage_eps,
+        advantage_normalizer=advantage_normalizer,
+    )
+    tokenized = tokenize_prompt_and_output(
+        prompt_strs=repeated_prompts,
+        output_strs=rollout_responses,
+        tokenizer=tokenizer,
+    )
+
+    device = next(model.parameters()).device
+    input_ids = tokenized["input_ids"].to(device)
+    labels = tokenized["labels"].to(device)
+    response_mask = tokenized["response_mask"].to(device)
+    advantages = advantages.to(device)
+
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+
+    microbatch_size = batch_size // gradient_accumulation_steps
+    total_loss = torch.zeros((), device=device)
+    mean_token_entropy = torch.zeros((), device=device)
+
+    # Each backward call adds to parameter.grad. The optimizer is stepped only
+    # after all microbatches have contributed their share of the batch loss.
+    for start in range(0, batch_size, microbatch_size):
+        end = start + microbatch_size
+        input_ids_microbatch = input_ids[start:end]
+        labels_microbatch = labels[start:end]
+        mask_microbatch = response_mask[start:end]
+        advantages_microbatch = advantages[start:end]
+
+        model_scores = get_response_log_probs(
+            model=model,
+            input_ids=input_ids_microbatch,
+            labels=labels_microbatch,
+            return_token_entropy=True,
+        )
+        per_token_loss, _ = compute_policy_gradient_loss(
+            raw_rewards_or_advantages=advantages_microbatch,
+            policy_log_probs=model_scores["log_probs"],
+            importance_reweighting_method=importance_reweighting_method,
+        )
+        microbatch_loss = aggregate_loss_across_microbatch(
+            per_token_policy_gradient_loss=per_token_loss,
+            mask=mask_microbatch,
+            loss_normalization=loss_normalization,
+        )
+
+        microbatch_weight = microbatch_size / batch_size
+        weighted_loss = microbatch_loss * microbatch_weight
+        weighted_loss.backward()
+        total_loss = total_loss + weighted_loss.detach()
+
+        token_entropy = model_scores["token_entropy"]
+        entropy_per_sequence = (token_entropy * mask_microbatch).sum(dim=1)
+        entropy_per_sequence = entropy_per_sequence / mask_microbatch.sum(dim=1)
+        mean_token_entropy = mean_token_entropy + (
+            entropy_per_sequence.mean().detach() * microbatch_weight
+        )
+
+    # Clip the complete accumulated gradient, not each microbatch separately.
+    clipping_limit = max_grad_norm if max_grad_norm is not None else float("inf")
+    gradient_norm = torch.nn.utils.clip_grad_norm_(
+        model.parameters(),
+        clipping_limit,
+    )
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+    metadata: dict[str, torch.Tensor | float] = dict(reward_metadata)
+    metadata.update(advantage_metadata)
+    metadata["loss"] = total_loss.item()
+    metadata["gradient_norm"] = gradient_norm.detach()
+    metadata["token_entropy"] = mean_token_entropy.item()
+    return total_loss, metadata
